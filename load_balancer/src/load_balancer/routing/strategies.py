@@ -246,7 +246,113 @@ class ConsistentHashingStrategy(RoutingStrategy):
         return self._hash_ring[sorted_hashes[0]]
 
 
-# Factory to get the strategy instance based on configuration
+class ComplexityRoutingStrategy(RoutingStrategy):
+    """Complexity-aware routing strategy.
+
+    For node selection it delegates to P2C (best performance within the tier).
+    The real value is in the scoring API used by main.py for model tier selection:
+    score_prompt_complexity() + get_complexity_model() let the router classify
+    a prompt into small / medium / large tiers before calling get_eligible_nodes().
+
+    Inspired by RouteLLM (Apache-2.0) — lm-sys/RouteLLM
+    Adaptation: heuristic scorer (no extra model call), wired into MODEL_CLASSES tiers.
+    """
+
+    # Complexity thresholds: [0, LOW) → small, [LOW, HIGH) → medium, [HIGH, 1] → large/any
+    LOW_THRESHOLD: float = 0.35
+    HIGH_THRESHOLD: float = 0.65
+
+    def __init__(self):
+        self._p2c = PowerOfTwoChoicesStrategy()
+
+    async def select_node(self, nodes: List[str], model_name: str, redis_client) -> Optional[str]:
+        return await self._p2c.select_node(nodes, model_name, redis_client)
+
+    @staticmethod
+    def score_prompt_complexity(messages: List[Dict]) -> float:
+        """Score prompt complexity from OpenAI-format messages. Returns [0.0, 1.0].
+
+        Four weighted signals (weights sum to exactly 1.0, no external calls):
+          - Character count:    weight 0.30  linear scale, cap at 10 000 chars
+          - Code fences (```):  weight 0.20  cap at 3 occurrences
+          - Multi-step markers: weight 0.25  cap at 4 phrase matches (case-insensitive)
+          - Reasoning keywords: weight 0.25  cap at 3 keyword matches (case-insensitive)
+
+        Each signal is individually clamped to [0, max_weight] before summing.
+        The total is clamped to [0.0, 1.0].
+
+        Inspired by RouteLLM (Apache-2.0) — lm-sys/RouteLLM
+        """
+        if not messages:
+            return 0.0
+
+        # Extract all text content from OpenAI-format messages
+        text_parts: List[str] = []
+        for m in messages:
+            content = m.get("content") or ""
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif isinstance(content, list):
+                # Vision / multimodal: only text blocks contribute
+                for block in content:
+                    if isinstance(block, dict):
+                        text_parts.append(block.get("text", ""))
+        raw_text = " ".join(text_parts)
+        # Lowercase for case-insensitive matching; length uses raw (same char count)
+        text = raw_text.lower()
+
+        score = 0.0
+
+        # Signal 1: character count — linear, cap at 10 000 chars (weight 0.30)
+        score += min(len(raw_text) / 10_000, 1.0) * 0.30
+
+        # Signal 2: code fence occurrences — cap at 3 (weight 0.20)
+        code_fence_count = raw_text.count("```")
+        score += min(code_fence_count / 3, 1.0) * 0.20
+
+        # Signal 3: multi-step step-number markers — cap at 4 (weight 0.25)
+        multi_step_patterns = ["step 1", "then,", "first,", "next,", "finally,"]
+        marker_count = sum(1 for p in multi_step_patterns if p in text)
+        score += min(marker_count / 4, 1.0) * 0.25
+
+        # Signal 4: deep-reasoning keywords — cap at 3 (weight 0.25)
+        reasoning_keywords = [
+            "analyze", "compare", "evaluate", "explain why",
+            "trade-off", "pros and cons",
+        ]
+        keyword_count = sum(1 for kw in reasoning_keywords if kw in text)
+        score += min(keyword_count / 3, 1.0) * 0.25
+
+        return min(1.0, score)
+
+    def get_complexity_model(
+        self, complexity: float, model_classes: Dict[str, Any]
+    ) -> Optional[List[str]]:
+        """Map a complexity score to MODEL_CLASSES tier candidates.
+
+        Returns a list of candidate model names for the appropriate tier,
+        or None when complexity is high (caller uses any available model).
+
+        Tier boundaries:
+          score < 0.35          → small tier  (MODEL_CLASSES["historical_small"])
+          0.35 ≤ score ≤ 0.65  → medium tier (MODEL_CLASSES["historical_medium"])
+          score > 0.65          → any tier    (returns None → caller selects freely)
+        """
+        if complexity < self.LOW_THRESHOLD:
+            cls = model_classes.get("historical_small") or {}
+            candidates = cls.get("candidates", [])
+            return candidates if candidates else None
+        # HIGH_THRESHOLD is inclusive: score == 0.65 is still medium
+        if complexity <= self.HIGH_THRESHOLD:
+            cls = model_classes.get("historical_medium") or {}
+            candidates = cls.get("candidates", [])
+            return candidates if candidates else None
+        return None  # High complexity → caller uses any available model
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
 STRATEGIES = {
     "ROUND_ROBIN": RoundRobinStrategy,
     "RANDOM": RandomStrategy,
@@ -254,13 +360,14 @@ STRATEGIES = {
     "P2C": PowerOfTwoChoicesStrategy,
     "POWER_OF_TWO": PowerOfTwoChoicesStrategy,
     "CONSISTENT_HASH": ConsistentHashingStrategy,
+    "COMPLEXITY": ComplexityRoutingStrategy,
 }
 
 def get_routing_strategy(strategy_name: str, **kwargs) -> RoutingStrategy:
     strategy_class = STRATEGIES.get(strategy_name.upper())
     if not strategy_class:
         raise ValueError(f"Unknown routing strategy: {strategy_name}")
-    
+
     # Pass configuration parameters for strategies that support them
     if strategy_name.upper() in ("P2C", "POWER_OF_TWO"):
         from .. import config
