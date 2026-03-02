@@ -12,19 +12,19 @@ function cleanup() {
 trap cleanup EXIT
 
 MODEL_ID="m"
+LB_URL="http://localhost:8001"
 
 echo "[ci-smoke] Bringing up stack..."
 ROUTING_STRATEGY=ROUND_ROBIN \
 STICKY_SESSIONS_ENABLED=true \
-SCAN_HOSTS='ai_lb_node1:9999,ai_lb_node2:9999' \
+SCAN_HOSTS='' \
 HEDGING_SMALL_MODELS_ONLY=false \
 HEDGING_MAX_DELAY_MS=0 \
-docker compose --profile full up -d --build
+docker compose up -d --build
 
-echo "[ci-smoke] Waiting for LB to respond (in-network)..."
+echo "[ci-smoke] Waiting for LB to respond..."
 for i in {1..120}; do
-  if docker ps --format '{{.Names}}' | grep -q '^ai_lb_monitor$' && \
-     docker exec -i ai_lb_monitor curl -sf http://ai_lb_load_balancer:8000/metrics >/dev/null; then
+  if curl -sf "$LB_URL/metrics" >/dev/null 2>&1; then
     break
   fi
   sleep 1
@@ -47,7 +47,7 @@ ok=0
 while (( round <= 3 )); do
   echo "[ci-smoke] Round $round: firing 10 non-stream requests to trigger hedging..."
   for i in $(seq 1 10); do
-    docker exec -i ai_lb_monitor curl -s -o /dev/null -X POST http://ai_lb_load_balancer:8000/v1/chat/completions \
+    curl -s -o /dev/null -X POST "$LB_URL/v1/chat/completions" \
       -H 'content-type: application/json' \
       -H 'x-session-id: s' \
       --data '{"model":"'"$MODEL_ID"'","messages":[{"role":"user","content":"hedge attempt '"$i"' (round '"$round"')"}],"max_tokens":8,"stream":false}' || true
@@ -57,16 +57,12 @@ while (( round <= 3 )); do
   # Poll metrics up to 10s for counters to appear
   METRICS=""
   for j in {1..10}; do
-    METRICS="$(docker exec -i ai_lb_monitor curl -s http://ai_lb_load_balancer:8000/metrics || true)"
+    METRICS="$(curl -s "$LB_URL/metrics" || true)"
     if [[ -n "$METRICS" ]]; then
       break
     fi
     sleep 1
   done
-  # Fallback to host if empty (debug)
-  if [[ -z "$METRICS" ]]; then
-    METRICS="$(curl -s http://localhost:8000/metrics || true)"
-  fi
   REQS=$(echo "$METRICS" | awk '/^ai_lb_requests_total /{print $2}')
   HEDGES=$(echo "$METRICS" | awk '/^ai_lb_hedges_total /{print $2}')
   WINS_MODEL=$(echo "$METRICS" | awk -v m="$MODEL_ID" '$1 ~ /^ai_lb_hedge_wins_total/ && $0 ~ "model=\""m"\"" {print $2}')
