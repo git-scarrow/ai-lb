@@ -6,13 +6,16 @@ cd "$ROOT_DIR"
 
 export COMPOSE_DOCKER_CLI_BUILD=1 DOCKER_BUILDKIT=1
 
+MODEL_ID="m"
+LB_URL="http://localhost:8001"
+STUB_PORT=9999
+STUB_PID=""
+
 function cleanup() {
+  [[ -n "$STUB_PID" ]] && kill "$STUB_PID" 2>/dev/null || true
   docker compose down -v || true
 }
 trap cleanup EXIT
-
-MODEL_ID="m"
-LB_URL="http://localhost:8001"
 
 echo "[ci-smoke] Bringing up stack..."
 ROUTING_STRATEGY=ROUND_ROBIN \
@@ -27,6 +30,42 @@ for i in {1..120}; do
   if curl -sf "$LB_URL/metrics" >/dev/null 2>&1; then
     break
   fi
+  sleep 1
+done
+
+echo "[ci-smoke] Starting stub backend on port $STUB_PORT..."
+python3 - <<'PYEOF' &
+import http.server, json, sys
+
+RESP = json.dumps({
+    "id": "chatcmpl-stub", "object": "chat.completion",
+    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+}).encode()
+
+MODELS = json.dumps({"object": "list", "data": [{"id": "m", "object": "model"}]}).encode()
+
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(MODELS)
+    def do_POST(self):
+        n = int(self.headers.get("content-length", 0))
+        self.rfile.read(n)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(RESP)
+
+http.server.HTTPServer(("0.0.0.0", 9999), H).serve_forever()
+PYEOF
+STUB_PID=$!
+# Wait for stub to be ready
+for i in {1..10}; do
+  if curl -sf "http://localhost:$STUB_PORT/v1/models" >/dev/null 2>&1; then break; fi
   sleep 1
 done
 
