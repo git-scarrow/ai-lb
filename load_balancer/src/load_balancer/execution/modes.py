@@ -803,3 +803,243 @@ class ExecutionEngine:
             oracle_present=oracle_present,
             is_cloud_fn=is_cloud_fn
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — SSE streaming PLAN execution
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PlanEvent:
+    """A single event emitted by the SSE PLAN execution pipeline."""
+    event_type: str  # plan_decomposed | task_started | task_finished | assembly_started | token | error
+    data: dict
+    timestamp: float = field(default_factory=time.time)
+
+
+_SSE_PLANNER_SYSTEM_PROMPT = (
+    "You are a task planning assistant. "
+    "Decompose the user's request into a minimal set of subtasks (at most 5). "
+    "Return ONLY valid JSON in this exact format:\n"
+    '{"goal": "<short goal summary>", "tasks": ['
+    '{"id": "t1", "capability": "general", "prompt": "<subtask instruction>", "depends_on": []},'
+    '{"id": "t2", "capability": "general", "prompt": "<subtask instruction>", "depends_on": ["t1"]}'
+    "]}\n"
+    "Do not include any text outside the JSON object."
+)
+
+
+def _parse_sse_plan_json(text: str) -> dict:
+    """Parse JSON from planner response, stripping markdown code fences if present."""
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\s*```$", "", text, flags=re.MULTILINE)
+    text = text.strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end >= start:
+        text = text[start: end + 1]
+    return json.loads(text)
+
+
+async def execute_plan_stream(
+    messages: list,
+    call_backend,
+    stream_backend,
+    planner_backend: str,
+    capability_nodes: dict,
+    default_nodes: list,
+    max_subtasks: int = 5,
+    subtask_timeout: float = 30.0,
+    overall_timeout: float = 120.0,
+):
+    """Async generator that drives the PLAN pipeline and yields PlanEvents.
+
+    Step 1 — Decompose: call the planner backend (blocking; full JSON needed).
+    Step 2 — Dispatch:  execute subtasks in topological batches (Kahn's algorithm).
+    Step 3 — Assemble:  stream assembly tokens from the planner backend.
+
+    Yields:
+        PlanEvent with event_type in:
+          plan_decomposed, task_started, task_finished, assembly_started, token, error
+    """
+    try:
+        # ── Step 1: Decompose ──────────────────────────────────────────────
+        decompose_messages = [
+            {"role": "system", "content": _SSE_PLANNER_SYSTEM_PROMPT},
+            *messages,
+        ]
+        plan_json_str = await asyncio.wait_for(
+            call_backend(planner_backend, decompose_messages),
+            timeout=subtask_timeout,
+        )
+        plan_data = _parse_sse_plan_json(plan_json_str)
+        tasks_raw = plan_data.get("tasks", [])[:max_subtasks]
+        goal = plan_data.get("goal", "")
+
+        yield PlanEvent(event_type="plan_decomposed", data={"goal": goal, "tasks": tasks_raw})
+
+        # ── Step 2: Dispatch (Kahn's topological batching) ─────────────────
+        task_map = {t["id"]: t for t in tasks_raw}
+        completed: dict[str, str] = {}  # task_id → result text
+        in_degree = {tid: len(t.get("depends_on", [])) for tid, t in task_map.items()}
+        ready = [tid for tid, deg in in_degree.items() if deg == 0]
+
+        while ready:
+            batch = ready[:]
+            ready = []
+
+            async def _run_task(tid: str):
+                task = task_map[tid]
+                cap = task.get("capability", "general")
+                node = (capability_nodes.get(cap) or default_nodes or [planner_backend])[0]
+                task_messages = [{"role": "user", "content": task["prompt"]}]
+                return tid, await asyncio.wait_for(
+                    call_backend(node, task_messages),
+                    timeout=subtask_timeout,
+                )
+
+            for tid in batch:
+                yield PlanEvent(event_type="task_started", data={"id": tid})
+
+            results = await asyncio.gather(*[_run_task(tid) for tid in batch], return_exceptions=True)
+
+            for tid_batch, item in zip(batch, results):
+                if isinstance(item, Exception):
+                    yield PlanEvent(event_type="error", data={"message": str(item), "task_id": tid_batch})
+                    yield PlanEvent(event_type="task_finished", data={"id": tid_batch, "success": False, "error": str(item)})
+                    continue
+                tid, result_text = item
+                completed[tid] = result_text
+                yield PlanEvent(event_type="task_finished", data={"id": tid, "result": result_text, "success": True})
+
+                # Unblock dependents
+                for other_id, other_task in task_map.items():
+                    if other_id in completed:
+                        continue
+                    if tid in other_task.get("depends_on", []):
+                        in_degree[other_id] -= 1
+                        if in_degree[other_id] == 0:
+                            ready.append(other_id)
+
+        # ── Step 3: Assemble and stream ────────────────────────────────────
+        context_parts = [f"Goal: {goal}"]
+        for tid, result in completed.items():
+            context_parts.append(f"Task {tid} result: {result}")
+        context_parts.append("Original request:")
+        for m in messages:
+            if m.get("role") == "user":
+                context_parts.append(m.get("content", ""))
+
+        assembly_messages = [{"role": "user", "content": "\n\n".join(context_parts)}]
+
+        yield PlanEvent(event_type="assembly_started", data={"goal": goal})
+
+        async for chunk in stream_backend(planner_backend, assembly_messages):
+            yield PlanEvent(event_type="token", data={"chunk": chunk})
+
+    except Exception as exc:
+        msg = str(exc)
+        # Annotate with pipeline stage for diagnostics
+        if "json" in type(exc).__name__.lower() or isinstance(exc, (ValueError, KeyError)):
+            msg = f"decompose: {msg}"
+        yield PlanEvent(event_type="error", data={"message": msg})
+
+
+async def collect_plan_result(gen) -> "PlanResult":
+    """Consume an execute_plan_stream generator and return a PlanResult."""
+    goal = ""
+    task_results: dict = {}
+    assembled_chunks: list = []
+
+    async for event in gen:
+        if event.event_type == "plan_decomposed":
+            goal = event.data.get("goal", "")
+        elif event.event_type == "task_finished":
+            task_results[event.data["id"]] = event.data.get("result", "")
+        elif event.event_type == "token":
+            chunk = event.data.get("chunk", b"")
+            if isinstance(chunk, bytes):
+                chunk = chunk.decode("utf-8", errors="ignore")
+            assembled_chunks.append(chunk)
+        elif event.event_type == "error":
+            logger.warning("plan error: %s", event.data.get("message") or event.data.get("error"))
+
+    assembled = "".join(assembled_chunks)
+    final = BackendResult(
+        backend="assembly",
+        success=True,
+        response_body={
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": assembled}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        },
+    )
+    return PlanResult(goal=goal, task_results=task_results, final_response=final)
+
+
+def plan_result_to_openai_response(result: "PlanResult") -> dict:
+    """Convert a PlanResult to an OpenAI-compatible chat completion response."""
+    content = ""
+    if result.final_response and result.final_response.response_body:
+        rb = result.final_response.response_body
+        # Support both {"content": "..."} and OpenAI choices format
+        if "choices" in rb:
+            content = (rb["choices"][0].get("message") or {}).get("content", "")
+        else:
+            content = rb.get("content", "")
+    return {
+        "id": f"plan-{int(time.time())}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": "plan",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "x-plan-goal": result.goal,
+        "x-plan-tasks": list(result.task_results.keys()),
+    }
+
+
+async def execute_plan(
+    messages,
+    call_backend,
+    planner_backend: str,
+    capability_nodes: dict,
+    default_nodes: list,
+    max_subtasks: int = 5,
+    subtask_timeout: float = 30.0,
+    overall_timeout: float = 120.0,
+    stream_backend=None,
+) -> PlanResult:
+    """Module-level wrapper: uses execute_plan_stream when stream_backend provided,
+    otherwise falls back to ExecutionEngine.execute_plan for backward compatibility."""
+    if stream_backend is not None:
+        return await collect_plan_result(
+            execute_plan_stream(
+                messages=messages,
+                call_backend=call_backend,
+                stream_backend=stream_backend,
+                planner_backend=planner_backend,
+                capability_nodes=capability_nodes,
+                default_nodes=default_nodes,
+                max_subtasks=max_subtasks,
+                subtask_timeout=subtask_timeout,
+                overall_timeout=overall_timeout,
+            )
+        )
+    engine = ExecutionEngine()
+    return await engine.execute_plan(
+        messages=messages,
+        call_backend=call_backend,
+        planner_backend=planner_backend,
+        capability_nodes=capability_nodes,
+        default_nodes=default_nodes,
+        max_subtasks=max_subtasks,
+        subtask_timeout=subtask_timeout,
+        overall_timeout=overall_timeout,
+    )

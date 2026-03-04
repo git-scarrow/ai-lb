@@ -24,6 +24,12 @@ from .execution import (
     PlanTask,
     PlanResult,
 )
+from .execution.modes import (
+    execute_plan_stream,
+    collect_plan_result,
+    plan_result_to_openai_response,
+    PlanEvent,
+)
 from .providers import get_adapter
 
 @asynccontextmanager
@@ -1645,10 +1651,14 @@ async def _handle_multi_backend_execution(
         # Perplexity Computer-style multi-step task decomposition + specialization
         planner_node = _resolve_planner_backend(oracle_backend)
         if not planner_node:
-            raise HTTPException(
-                status_code=503,
-                detail="PLAN mode requires PLANNER_BACKEND to be configured (or x-consensus-oracle set)"
-            )
+            # Fall back to first eligible node when no explicit planner is configured
+            if all_eligible:
+                planner_node = all_eligible[0]
+            else:
+                raise HTTPException(
+                    status_code=503,
+                    detail="PLAN mode requires PLANNER_BACKEND to be configured (or x-consensus-oracle set)"
+                )
 
         # Build capability → eligible nodes mapping from all eligible nodes
         caps_map = getattr(config, "BACKEND_CAPABILITIES", {}) or {}
@@ -1657,6 +1667,55 @@ async def _handle_multi_backend_execution(
             key = node.replace("cloud:", "") if node.startswith("cloud:") else node
             for cap in caps_map.get(key, []):
                 capability_nodes.setdefault(cap, []).append(node)
+
+        # SSE streaming path: Accept: text/event-stream → execute_plan_stream
+        accept_header = request.headers.get("accept", "")
+        if "text/event-stream" in accept_header:
+            async def _sse_call_backend(node: str, messages: list) -> str:
+                plan_body = {**body, "messages": messages, "stream": False}
+                resp = await http_client.post(
+                    f"http://{node}/v1/chat/completions",
+                    json=plan_body,
+                    headers={k: v for k, v in headers.items() if k.lower() not in ("host", "content-length")},
+                )
+                resp.raise_for_status()
+                return resp.json()["choices"][0]["message"]["content"]
+
+            async def _sse_stream_backend(node: str, messages: list):
+                async for chunk in stream_backend(node, messages, model_name, request_id):
+                    yield chunk
+
+            async def _plan_sse_generator():
+                async for event in execute_plan_stream(
+                    messages=body.get("messages", []),
+                    call_backend=_sse_call_backend,
+                    stream_backend=_sse_stream_backend,
+                    planner_backend=planner_node,
+                    capability_nodes=capability_nodes,
+                    default_nodes=list(all_eligible),
+                    max_subtasks=int(getattr(config, "PLAN_MAX_SUBTASKS", 5)),
+                    subtask_timeout=float(getattr(config, "PLAN_SUBTASK_TIMEOUT_SECS", 30.0)),
+                ):
+                    if event.event_type == "token":
+                        yield f"data: {event.data['chunk']}\n\n".encode() if isinstance(event.data['chunk'], str) else (b"data: " + event.data['chunk'] + b"\n\n")
+                    elif event.event_type == "error":
+                        yield f"event: error\ndata: {json.dumps(event.data)}\n\n".encode()
+                    else:
+                        yield f"event: {event.event_type}\ndata: {json.dumps(event.data)}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+
+            return StreamingResponse(
+                _plan_sse_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                    "x-request-id": request_id,
+                    "x-execution-mode": "plan",
+                },
+            )
+
+        # Non-streaming path (existing)
 
         # call_backend: make an HTTP call to a specific backend with specific messages
         async def call_backend_for_plan(backend_node: str, plan_messages: List[Dict]) -> BackendResult:
@@ -1682,13 +1741,16 @@ async def _handle_multi_backend_execution(
         if plan_result.error and not plan_result.final_response:
             raise HTTPException(status_code=502, detail=f"PLAN execution failed: {plan_result.error}")
 
-        # Use final assembled response as the output
+        # Use final assembled response as the output — format as OpenAI chat.completion
         final = plan_result.final_response
-        resp_body = (final.response_body or {}) if final and final.success else {
-            "error": plan_result.error or "Plan assembly failed",
-            "goal": plan_result.goal,
-            "tasks_completed": len([r for r in plan_result.task_results.values() if r.success]),
-        }
+        if final and final.success:
+            resp_body = plan_result_to_openai_response(plan_result)
+        else:
+            resp_body = {
+                "error": plan_result.error or "Plan assembly failed",
+                "goal": plan_result.goal,
+                "tasks_completed": len([r for r in plan_result.task_results.values() if r.success]),
+            }
         out = JSONResponse(content=resp_body)
         # Expose plan metadata in response headers
         out.headers["x-plan-goal"] = (plan_result.goal or "")[:200]
@@ -1983,6 +2045,37 @@ async def _record_stream_duration(model: str, node: str, elapsed_secs: float):
     except Exception:
         pass
 
+async def stream_backend(node: str, messages: list, model: str, request_id: str):
+    """Stream a custom messages payload to a backend node.
+
+    Used by the PLAN assembly phase to stream synthesized responses with
+    different messages than the original request body.
+    """
+    url = f"http://{node}/v1/chat/completions"
+    req_body = {"model": model, "messages": messages, "stream": True}
+    req_headers = {"x-request-id": request_id}
+    async with http_client.stream("POST", url, json=req_body, headers=req_headers) as response:
+        async for chunk in response.aiter_bytes():
+            yield chunk
+
+
+async def _record_output_tokens(model: str, node: str, tokens: int):
+    """Update EWMA of output tokens per model+node for cost-aware P2C scoring."""
+    try:
+        alpha = float(getattr(config, "COST_EWMA_ALPHA", 0.3))
+        ttl = int(getattr(config, "COST_EWMA_TTL_SECS", 3600))
+        key_ewma = f"lb:output_tokens_ewma:{model}|{node}"
+        key_count = f"lb:output_tokens_count:{model}|{node}"
+        current = await redis_client.get(key_ewma)
+        new_ewma = float(tokens) if current is None else (alpha * float(tokens) + (1.0 - alpha) * float(current))
+        await redis_client.set(key_ewma, new_ewma)
+        await redis_client.expire(key_ewma, ttl)
+        await redis_client.incrby(key_count, 1)
+        await redis_client.expire(key_count, ttl)
+    except Exception:
+        pass
+
+
 @app.api_route("/v1/chat/completions", methods=["POST"])
 async def chat_completions(request: Request):
     """Receives a chat completion request, routes it, and streams the response."""
@@ -2225,8 +2318,24 @@ async def chat_completions(request: Request):
                                 yield f"data: {json.dumps(transformed)}\n\n".encode()
                 else:
                     # Passthrough for local/OpenAI-compatible backends
+                    # If cost-aware P2C is enabled, parse usage from stream chunks
+                    _beta = float(getattr(config, "P2C_BETA", 0.0))
+                    _last_completion_tokens = 0
                     async for chunk in response.aiter_bytes():
+                        if _beta > 0:
+                            try:
+                                text = chunk.decode("utf-8", errors="ignore")
+                                for line in text.split("\n"):
+                                    if line.startswith("data: ") and "[DONE]" not in line:
+                                        payload = json.loads(line[6:])
+                                        ct = int((payload.get("usage") or {}).get("completion_tokens", 0))
+                                        if ct > 0:
+                                            _last_completion_tokens = ct
+                            except Exception:
+                                pass
                         yield chunk
+                    if _beta > 0 and _last_completion_tokens > 0:
+                        await _record_output_tokens(model_name, node, _last_completion_tokens)
             await _record_success(node)
             await _clear_rate_limit(node)
         finally:
@@ -2650,6 +2759,15 @@ async def chat_completions(request: Request):
                 raise httpx.HTTPStatusError("Upstream retryable error", request=None, response=None)
             await _record_success(node)
             await _clear_rate_limit(node)
+            # Cost-aware P2C: record output tokens in EWMA when beta > 0
+            if float(getattr(config, "P2C_BETA", 0.0)) > 0 and status_code == 200:
+                try:
+                    _resp_data = json.loads(content)
+                    _ct = int((_resp_data.get("usage") or {}).get("completion_tokens", 0))
+                    if _ct > 0:
+                        await _record_output_tokens(model_name, node, _ct)
+                except Exception:
+                    pass
             # Transform response for cloud backends
             if adapter and status_code == 200:
                 try:
@@ -3461,6 +3579,13 @@ async def set_prefs(request: Request):
     if isinstance(strat, str) and strat.lower() in ("any_first", "intersection_first"):
         config.AUTO_MODEL_STRATEGY = strat
         applied["auto_model_strategy"] = strat
+    bcp = body.get("backend_cost_per_token")
+    if isinstance(bcp, dict):
+        try:
+            config.BACKEND_COST_PER_TOKEN = {str(k): v for k, v in bcp.items()}
+            applied["backend_cost_per_token"] = config.BACKEND_COST_PER_TOKEN
+        except Exception:
+            pass
     return {"ok": True, "applied": applied}
 
 
