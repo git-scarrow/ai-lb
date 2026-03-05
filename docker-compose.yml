@@ -82,6 +82,8 @@ services:
       MULTI_EXEC_CONSENSUS_THRESHOLD: ${MULTI_EXEC_CONSENSUS_THRESHOLD:-0.9}
       BACKEND_ALIASES: ${BACKEND_ALIASES:-}
       MODEL_EQUIVALENTS: ${MODEL_EQUIVALENTS:-}
+      # PLAN mode planner selection
+      PLANNER_BACKEND: ${PLANNER_BACKEND:-}
       # Cloud backends and fallback chains
       CLOUD_BACKENDS: ${CLOUD_BACKENDS:-}
       CLOUD_MODELS: ${CLOUD_MODELS:-}

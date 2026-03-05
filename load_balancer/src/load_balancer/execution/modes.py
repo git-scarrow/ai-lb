@@ -939,7 +939,7 @@ async def execute_plan_stream(
             yield PlanEvent(event_type="token", data={"chunk": chunk})
 
     except Exception as exc:
-        msg = str(exc)
+        msg = str(exc) or f"({type(exc).__name__})"
         # Annotate with pipeline stage for diagnostics
         if "json" in type(exc).__name__.lower() or isinstance(exc, (ValueError, KeyError)):
             msg = f"decompose: {msg}"

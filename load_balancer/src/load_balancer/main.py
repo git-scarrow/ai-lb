@@ -1676,7 +1676,7 @@ async def _handle_multi_backend_execution(
                 resp = await http_client.post(
                     f"http://{node}/v1/chat/completions",
                     json=plan_body,
-                    headers={k: v for k, v in headers.items() if k.lower() not in ("host", "content-length")},
+                    headers={k: v for k, v in headers.items() if k.lower() not in ("host", "content-length", "accept")},
                 )
                 resp.raise_for_status()
                 return resp.json()["choices"][0]["message"]["content"]
@@ -1694,10 +1694,12 @@ async def _handle_multi_backend_execution(
                     capability_nodes=capability_nodes,
                     default_nodes=list(all_eligible),
                     max_subtasks=int(getattr(config, "PLAN_MAX_SUBTASKS", 5)),
-                    subtask_timeout=float(getattr(config, "PLAN_SUBTASK_TIMEOUT_SECS", 30.0)),
+                    subtask_timeout=float(getattr(config, "PLAN_SUBTASK_TIMEOUT_SECS", 90.0)),
                 ):
                     if event.event_type == "token":
-                        yield f"data: {event.data['chunk']}\n\n".encode() if isinstance(event.data['chunk'], str) else (b"data: " + event.data['chunk'] + b"\n\n")
+                        # chunk is already SSE-formatted bytes from stream_backend (e.g. b"data: {...}\n\n")
+                        chunk = event.data["chunk"]
+                        yield chunk if isinstance(chunk, bytes) else chunk.encode()
                     elif event.event_type == "error":
                         yield f"event: error\ndata: {json.dumps(event.data)}\n\n".encode()
                     else:

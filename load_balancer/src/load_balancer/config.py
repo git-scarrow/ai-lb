@@ -347,7 +347,7 @@ BACKEND_CAPABILITIES: dict = _parse_backend_capabilities(os.getenv("BACKEND_CAPA
 # ---------------------------------------------------------------------------
 PLANNER_BACKEND: str = os.getenv("PLANNER_BACKEND", "")
 PLAN_MAX_SUBTASKS: int = int(os.getenv("PLAN_MAX_SUBTASKS", "5"))
-PLAN_SUBTASK_TIMEOUT_SECS: float = float(os.getenv("PLAN_SUBTASK_TIMEOUT_SECS", "30.0"))
+PLAN_SUBTASK_TIMEOUT_SECS: float = float(os.getenv("PLAN_SUBTASK_TIMEOUT_SECS", "90.0"))
 
 # ---------------------------------------------------------------------------
 # Complexity-based routing (inspired by RouteLLM, Apache-2.0 — lm-sys/RouteLLM)
