@@ -1,4 +1,5 @@
 import httpx
+import math
 import random
 import redis.asyncio as redis
 import json
@@ -188,20 +189,27 @@ async def get_eligible_nodes(model_name: str, include_cloud: bool = True):
         supports_key = f"node:{node}:supports:{model_name}"
         supports = await redis_client.get(supports_key)
         if any(m.get("id") == model_name for m in models) or (supports is not None and supports != "0"):
-            # Enforce p95 threshold if configured (>0)
-            try:
-                max_p95 = float(getattr(config, "MAX_P95_LATENCY_SECS", 0) or 0)
-            except Exception:
-                max_p95 = 0.0
-            if max_p95 > 0:
-                # Require a minimum number of samples before enforcing p95 threshold
+            eligible_nodes.append(node)
+
+    # Enforce p95 threshold only when multiple nodes serve this model;
+    # with a single node, filtering it out just guarantees failure.
+    if len(eligible_nodes) >= 2:
+        try:
+            max_p95 = float(getattr(config, "MAX_P95_LATENCY_SECS", 0) or 0)
+        except Exception:
+            max_p95 = 0.0
+        if max_p95 > 0:
+            filtered = []
+            for node in eligible_nodes:
                 cnt = await _series_count(model_name, node)
                 if cnt >= getattr(config, "ELIGIBILITY_MIN_P95_SAMPLES", 20):
                     p95 = await _series_p95(model_name, node)
                     if p95 and p95 > max_p95:
-                        # Defer: skip node until it recovers
                         continue
-            eligible_nodes.append(node)
+                filtered.append(node)
+            # Keep at least one node — don't filter all of them out
+            if filtered:
+                eligible_nodes = filtered
 
     # Add eligible cloud backends
     if include_cloud:
@@ -407,6 +415,33 @@ async def _dec_inflight(node: str):
     except Exception:
         pass
 
+def _describe_upstream_error(e: Exception) -> str:
+    """Extract actionable detail from upstream exceptions for diagnostics."""
+    parts = [type(e).__name__]
+    if isinstance(e, httpx.HTTPStatusError):
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            parts.append(f"status={resp.status_code}")
+            try:
+                body = resp.text[:300]
+            except Exception:
+                body = ""
+            if body:
+                parts.append(f"body={body!r}")
+    elif isinstance(e, httpx.RequestError):
+        # ConnectError, TimeoutException, etc.
+        cause = e.__cause__ or e.__context__
+        if cause:
+            parts.append(str(cause))
+        elif str(e):
+            parts.append(str(e))
+    else:
+        msg = str(e)
+        if msg:
+            parts.append(msg)
+    return " | ".join(parts)
+
+
 class CapacityError(Exception):
     def __init__(self, scope: str = "node"):
         self.scope = scope
@@ -473,7 +508,7 @@ async def _penalize_failure(node: str):
     except Exception:
         pass
 
-async def _record_failure(node: str):
+async def _record_failure(node: str, model: str = ""):
     try:
         key = f"node:{node}:failures"
         failures = await redis_client.incrby(key, 1)
@@ -483,6 +518,9 @@ async def _record_failure(node: str):
             await redis_client.expire(f"node:{node}:cb_open", _cb_cooldown_secs())
     except Exception:
         pass
+    # Inject penalty RTT into EWMA so P2C scoring naturally degrades this node
+    if model:
+        await _record_failure_penalty(model, node)
 
 async def _record_success(node: str):
     try:
@@ -2024,6 +2062,52 @@ async def _record_latency(model: str, node: str, elapsed_secs: float):
                 await redis_client.incrby(key, 1)
     except Exception:
         pass
+    # Also update Peak EWMA RTT for P2C scoring
+    await _record_ewma_rtt(model, node, elapsed_secs)
+
+async def _record_ewma_rtt(model: str, node: str, elapsed_secs: float):
+    """Update Peak EWMA RTT for a (model, node) pair.
+
+    Inspired by Finagle/Envoy Peak EWMA (Apache-2.0):
+      alpha = 1 - exp(-(now - last_update) / decay_time)
+      new_ewma = alpha * observed + (1 - alpha) * old_ewma
+    """
+    try:
+        key_rtt = f"lb:ewma_rtt:{model}|{node}"
+        key_ts = f"lb:ewma_ts:{model}|{node}"
+        now = time.time()
+        decay = config.PEAK_EWMA_DECAY_SECS
+
+        old_rtt_raw = await redis_client.get(key_rtt)
+        old_ts_raw = await redis_client.get(key_ts)
+
+        if old_rtt_raw is None or old_ts_raw is None:
+            # Cold start: seed with observed value
+            new_rtt = elapsed_secs
+        else:
+            old_rtt = float(old_rtt_raw)
+            old_ts = float(old_ts_raw)
+            dt = max(now - old_ts, 0.0)
+            alpha = 1.0 - math.exp(-dt / decay) if decay > 0 else 1.0
+            new_rtt = alpha * elapsed_secs + (1.0 - alpha) * old_rtt
+
+        await redis_client.set(key_rtt, str(new_rtt))
+        await redis_client.set(key_ts, str(now))
+        # TTL so stale entries clean up (10x decay time)
+        ttl = int(decay * 10) or 120
+        await redis_client.expire(key_rtt, ttl)
+        await redis_client.expire(key_ts, ttl)
+    except Exception:
+        pass
+
+async def _record_failure_penalty(model: str, node: str):
+    """Record a failure as a penalty RTT in the EWMA.
+
+    Instead of a binary circuit breaker, failures inject a large RTT value
+    (PEAK_EWMA_PENALTY_RTT, default 30s) into the EWMA, which naturally
+    decays over time — graduated degradation instead of hard cutoff.
+    """
+    await _record_ewma_rtt(model, node, config.PEAK_EWMA_PENALTY_RTT)
 
 async def _record_stream_ttfb(model: str, node: str, elapsed_secs: float):
     try:
@@ -2353,11 +2437,23 @@ async def chat_completions(request: Request):
         last_error = None
         all_capacity = True
         first_byte_recorded = False
+        same_node_retries = 0
         # We allow at most first try + MAX_RETRIES additional
         budget = min(len(nodes), 1 + config.MAX_RETRIES)
+        # When only 1 node exists, allow same-node retries with delay
+        if len(nodes) == 1 and config.SAME_NODE_RETRY_ENABLED:
+            budget = 1 + config.SAME_NODE_RETRY_MAX
         while attempts < budget:
             # prefer nodes without open circuit
             remaining = [n for n in nodes if n not in tried]
+            # Same-node retry: if no untried nodes remain, clear tried and delay
+            if not remaining and len(nodes) == 1 and config.SAME_NODE_RETRY_ENABLED and same_node_retries < config.SAME_NODE_RETRY_MAX:
+                same_node_retries += 1
+                logger.info("[req=stream] Same-node retry %d/%d for %s after %.1fs delay",
+                            same_node_retries, config.SAME_NODE_RETRY_MAX, nodes[0], config.SAME_NODE_RETRY_DELAY_SECS)
+                await asyncio.sleep(config.SAME_NODE_RETRY_DELAY_SECS)
+                tried.clear()
+                remaining = list(nodes)
             closed = []
             for n in remaining:
                 if not await _is_circuit_open(n):
@@ -2597,8 +2693,8 @@ async def chat_completions(request: Request):
                         pass
                     return
             except (httpx.RequestError, httpx.HTTPStatusError, CapacityError, RateLimitError) as e:
-                logger.warning("[req=%s] Upstream error from %s: %s (attempt %d/%d)", request_id, candidate, e, attempts, budget)
-                await _record_failure(candidate)
+                logger.warning("[req=%s] Upstream error from %s: %s (attempt %d/%d)", request_id, candidate, _describe_upstream_error(e), attempts, budget)
+                await _record_failure(candidate, model_name)
                 last_error = e
                 if not isinstance(e, CapacityError):
                     all_capacity = False
@@ -2841,8 +2937,20 @@ async def chat_completions(request: Request):
     budget = min(len(eligible_nodes), 1 + config.MAX_RETRIES)
     all_capacity = True
     tried_order = []
+    same_node_retries = 0
+    # When only 1 node exists, allow same-node retries with delay
+    if len(eligible_nodes) == 1 and config.SAME_NODE_RETRY_ENABLED:
+        budget = 1 + config.SAME_NODE_RETRY_MAX
     while attempts < budget:
         remaining = [n for n in eligible_nodes if n not in tried]
+        # Same-node retry: if no untried nodes remain, clear tried and delay
+        if not remaining and len(eligible_nodes) == 1 and config.SAME_NODE_RETRY_ENABLED and same_node_retries < config.SAME_NODE_RETRY_MAX:
+            same_node_retries += 1
+            logger.info("[req=%s] Same-node retry %d/%d for %s after %.1fs delay",
+                        request_id, same_node_retries, config.SAME_NODE_RETRY_MAX, eligible_nodes[0], config.SAME_NODE_RETRY_DELAY_SECS)
+            await asyncio.sleep(config.SAME_NODE_RETRY_DELAY_SECS)
+            tried.clear()
+            remaining = list(eligible_nodes)
         closed = []
         for n in remaining:
             if not await _is_circuit_open(n):
@@ -3003,8 +3111,8 @@ async def chat_completions(request: Request):
                                     return resp
                                 except Exception as e2:
                                     # Both failed; fall through to normal failure handling
-                                    await _record_failure(candidate)
-                                    await _record_failure(secondary)
+                                    await _record_failure(candidate, model_name)
+                                    await _record_failure(secondary, model_name)
                                     last_error = e2
                                     all_capacity = False
                                     tried.add(secondary)
@@ -3012,7 +3120,7 @@ async def chat_completions(request: Request):
                                     continue
                 except (httpx.RequestError, httpx.HTTPStatusError, CapacityError, RateLimitError) as e:
                     # Primary threw before delay elapsed; treat as normal failure (no hedge launched)
-                    await _record_failure(candidate)
+                    await _record_failure(candidate, model_name)
                     last_error = e
                     if not isinstance(e, CapacityError):
                         all_capacity = False
@@ -3033,8 +3141,8 @@ async def chat_completions(request: Request):
                 pass
             return resp
         except (httpx.RequestError, httpx.HTTPStatusError, CapacityError, RateLimitError) as e:
-            logger.warning("[req=%s] Chat (non-stream) upstream error from %s: %s (attempt %d/%d)", request_id, candidate, e, attempts, budget)
-            await _record_failure(candidate)
+            logger.warning("[req=%s] Chat (non-stream) upstream error from %s: %s (attempt %d/%d)", request_id, candidate, _describe_upstream_error(e), attempts, budget)
+            await _record_failure(candidate, model_name)
             last_error = e
             if not isinstance(e, CapacityError):
                 all_capacity = False
@@ -3211,8 +3319,18 @@ async def embeddings(request: Request):
     all_capacity = True
     budget = min(len(eligible_nodes), 1 + config.MAX_RETRIES)
     tried_order = []
+    same_node_retries = 0
+    if len(eligible_nodes) == 1 and config.SAME_NODE_RETRY_ENABLED:
+        budget = 1 + config.SAME_NODE_RETRY_MAX
     while attempts < budget:
         remaining = [n for n in eligible_nodes if n not in tried]
+        if not remaining and len(eligible_nodes) == 1 and config.SAME_NODE_RETRY_ENABLED and same_node_retries < config.SAME_NODE_RETRY_MAX:
+            same_node_retries += 1
+            logger.info("[req=%s] Same-node retry %d/%d for %s after %.1fs delay",
+                        request_id, same_node_retries, config.SAME_NODE_RETRY_MAX, eligible_nodes[0], config.SAME_NODE_RETRY_DELAY_SECS)
+            await asyncio.sleep(config.SAME_NODE_RETRY_DELAY_SECS)
+            tried.clear()
+            remaining = list(eligible_nodes)
         closed = []
         for n in remaining:
             if not await _is_circuit_open(n):
@@ -3255,8 +3373,8 @@ async def embeddings(request: Request):
                 pass
             return resp
         except (httpx.RequestError, httpx.HTTPStatusError, CapacityError, RateLimitError) as e:
-            logger.warning("[req=%s] Embeddings upstream error from %s: %s (attempt %d/%d)", request_id, candidate, e, attempts, budget)
-            await _record_failure(candidate)
+            logger.warning("[req=%s] Embeddings upstream error from %s: %s (attempt %d/%d)", request_id, candidate, _describe_upstream_error(e), attempts, budget)
+            await _record_failure(candidate, model_name)
             last_error = e
             if not isinstance(e, CapacityError):
                 all_capacity = False

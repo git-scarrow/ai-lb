@@ -83,14 +83,21 @@ class LeastLoadedStrategy(RoutingStrategy):
 
 class PowerOfTwoChoicesStrategy(RoutingStrategy):
     """Power of Two Choices routing: sample 2 eligible nodes, pick the one with lower score.
-    Score = inflight_normalized + alpha * p95_latency_ewma + penalty_for_recent_5xx + beta * cost_normalized
-    beta=0 (default) disables cost term, preserving existing behavior exactly.
+
+    Supports two scoring modes:
+    - **Peak EWMA** (default, P2C_PEAK_EWMA=true): Finagle/Envoy-inspired multiplicative
+      scoring: score = ewma_rtt * (pending + 1). Dimensionally consistent, no tunable weights.
+      Failures inject penalty RTT that decays naturally.
+    - **Legacy additive** (P2C_PEAK_EWMA=false): score = inflight/maxconn + alpha*p95 + penalty*failures.
+
+    Cost term (beta > 0) is additive on top of either mode.
     """
 
     def __init__(self, alpha: float = 0.5, penalty_weight: float = 2.0, beta: float = 0.0):
         self.alpha = alpha
         self.penalty_weight = penalty_weight
         self.beta = beta
+        self.use_peak_ewma = getattr(_config, "P2C_PEAK_EWMA", True)
 
     async def select_node(self, nodes: List[str], model_name: str, redis_client) -> Optional[str]:
         if not nodes:
@@ -101,10 +108,15 @@ class PowerOfTwoChoicesStrategy(RoutingStrategy):
         # Sample 2 nodes randomly
         candidates = random.sample(nodes, min(2, len(nodes)))
 
-        # Calculate base scores for each candidate
-        scores = {}
-        for node in candidates:
-            scores[node] = await self._calculate_node_score(node, model_name, redis_client)
+        # Calculate scores for each candidate
+        if self.use_peak_ewma:
+            scores = {}
+            for node in candidates:
+                scores[node] = await self._peak_ewma_score(node, model_name, redis_client)
+        else:
+            scores = {}
+            for node in candidates:
+                scores[node] = await self._legacy_score(node, model_name, redis_client)
 
         # Add cost term with min-max normalization across candidates (opt-in via beta > 0)
         if self.beta > 0:
@@ -118,32 +130,75 @@ class PowerOfTwoChoicesStrategy(RoutingStrategy):
 
         return min(scores, key=lambda n: scores[n])
 
-    async def _calculate_node_score(self, node: str, model_name: str, redis_client) -> float:
-        """Calculate node score based on inflight requests, latency, and failure rate."""
+    # ---------- Peak EWMA scoring (Finagle/Envoy, Apache-2.0) ----------
+
+    async def _peak_ewma_score(self, node: str, model_name: str, redis_client) -> float:
+        """Score = ewma_rtt * (pending + 1).
+
+        Inspired by twitter/finagle PeakEwma.scala and envoyproxy/envoy PR #40653.
+        Multiplicative composition means units are request-seconds (Little's Law).
+        No tunable weights — latency and load naturally balance.
+        """
         try:
-            # Get inflight requests and normalize
+            # Get current EWMA RTT (with time decay applied)
+            ewma_rtt = await self._get_ewma_rtt(node, model_name, redis_client)
+
+            # Get pending (inflight) requests
+            inflight_val = await redis_client.get(f"node:{node}:inflight")
+            pending = int(inflight_val) if inflight_val is not None else 0
+
+            return ewma_rtt * (pending + 1)
+        except Exception:
+            return float("inf")
+
+    async def _get_ewma_rtt(self, node: str, model_name: str, redis_client) -> float:
+        """Retrieve EWMA RTT with time-based decay applied at read time.
+
+        If no data exists, returns PEAK_EWMA_DEFAULT_RTT (cold start).
+        Stale data decays toward zero, naturally encouraging probe traffic
+        to nodes that haven't been sampled recently.
+        """
+        key_rtt = f"lb:ewma_rtt:{model_name}|{node}"
+        key_ts = f"lb:ewma_ts:{model_name}|{node}"
+        default_rtt = getattr(_config, "PEAK_EWMA_DEFAULT_RTT", 0.5)
+        decay = getattr(_config, "PEAK_EWMA_DECAY_SECS", 10.0)
+
+        rtt_raw = await redis_client.get(key_rtt)
+        ts_raw = await redis_client.get(key_ts)
+
+        if rtt_raw is None or ts_raw is None:
+            return default_rtt
+
+        stored_rtt = float(rtt_raw)
+        stored_ts = float(ts_raw)
+        now = time.time()
+        dt = max(now - stored_ts, 0.0)
+
+        # Apply decay: the older the measurement, the more it shrinks toward zero
+        # This encourages the balancer to probe nodes it hasn't heard from recently
+        decay_factor = math.exp(-dt / decay) if decay > 0 else 0.0
+        return stored_rtt * decay_factor
+
+    # ---------- Legacy additive scoring ----------
+
+    async def _legacy_score(self, node: str, model_name: str, redis_client) -> float:
+        """Legacy additive score: inflight/maxconn + alpha*p95 + penalty*failures."""
+        try:
             inflight_val = await redis_client.get(f"node:{node}:inflight")
             maxconn_val = await redis_client.get(f"node:{node}:maxconn")
             inflight = int(inflight_val) if inflight_val is not None else 0
-            maxconn = int(maxconn_val) if maxconn_val not in (None, "", "0") else 100  # Default cap
-            
+            maxconn = int(maxconn_val) if maxconn_val not in (None, "", "0") else 100
+
             inflight_normalized = inflight / maxconn
-            
-            # Get p95 latency EWMA for this model+node
+
             series_key = f"{model_name}|{node}"
             p95_latency = await self._get_p95_latency(series_key, redis_client)
-            
-            # Get recent 5xx failure rate
+
             failure_rate = await self._get_failure_rate(node, redis_client)
-            
-            # Calculate composite score
-            score = inflight_normalized + (self.alpha * p95_latency) + (self.penalty_weight * failure_rate)
-            
-            return score
-            
+
+            return inflight_normalized + (self.alpha * p95_latency) + (self.penalty_weight * failure_rate)
         except Exception:
-            # On any error, return high score to deprioritize this node
-            return float('inf')
+            return float("inf")
 
     async def _get_p95_latency(self, series_key: str, redis_client) -> float:
         """Calculate approximate p95 latency from histogram buckets."""
@@ -151,43 +206,38 @@ class PowerOfTwoChoicesStrategy(RoutingStrategy):
             buckets = [0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, float("inf")]
             total_count = 0
             cumulative_counts = []
-            
-            # Get cumulative counts for each bucket
+
             for le in buckets:
                 val = await redis_client.get(f"lb:latency_bucket:{series_key}:{le}")
                 count = int(val) if val else 0
                 cumulative_counts.append(count)
                 if le == float("inf"):
                     total_count = count
-            
+
             if total_count == 0:
                 return 0.0
-            
-            # Find p95 bucket (95th percentile)
+
             p95_target = total_count * 0.95
-            
+
             for i, count in enumerate(cumulative_counts):
                 if count >= p95_target:
-                    # Linear interpolation within bucket
                     if i == 0:
-                        return buckets[i] * 0.5  # Assume uniform distribution in first bucket
-                    
+                        return buckets[i] * 0.5
                     lower_bound = buckets[i-1] if i > 0 else 0
                     upper_bound = buckets[i]
-
-                    if i < len(cumulative_counts) - 1:  # Not the infinity bucket
+                    if i < len(cumulative_counts) - 1:
                         prev_count = cumulative_counts[i-1] if i > 0 else 0
                         bucket_range = count - prev_count
                         if bucket_range > 0:
                             position = (p95_target - prev_count) / bucket_range
                             return lower_bound + position * (upper_bound - lower_bound)
-
                     return upper_bound if upper_bound != float("inf") else 10.0
-            
+
             return 0.0
-            
         except Exception:
             return 0.0
+
+    # ---------- Shared helpers ----------
 
     async def _get_cost_estimate(self, node: str, model_name: str, redis_client) -> float:
         """Return estimated cost (USD) for one request to node based on EWMA output tokens."""
@@ -195,7 +245,7 @@ class PowerOfTwoChoicesStrategy(RoutingStrategy):
             pricing = getattr(_config, "BACKEND_COST_PER_TOKEN", {}).get(model_name)
             if not pricing:
                 return 0.0
-            output_price = float(pricing.get("output", 0.0))  # USD per 1M tokens
+            output_price = float(pricing.get("output", 0.0))
             if output_price <= 0:
                 return 0.0
             cold_start = float(getattr(_config, "COST_EWMA_COLD_START_TOKENS", 256))
@@ -211,15 +261,11 @@ class PowerOfTwoChoicesStrategy(RoutingStrategy):
             return 0.0
 
     async def _get_failure_rate(self, node: str, redis_client) -> float:
-        """Get recent failure rate for the node."""
+        """Get recent failure rate for the node (legacy scoring only)."""
         try:
             failures = await redis_client.get(f"node:{node}:failures")
             failure_count = int(failures) if failures else 0
-            
-            # Normalize failure count to a rate (simple approach)
-            # This could be enhanced with time-window tracking
-            return min(failure_count / 10.0, 1.0)  # Cap at 1.0
-            
+            return min(failure_count / 10.0, 1.0)
         except Exception:
             return 0.0
 

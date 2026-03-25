@@ -105,8 +105,15 @@ MODEL_CLASSES.update(_parse_model_classes("LB_MODEL_CLASSES"))
 
 # Power of Two Choices routing configuration
 P2C_ROUTING_ENABLED = os.getenv("P2C_ROUTING_ENABLED", "true").lower() in ("1", "true", "yes")
-P2C_ALPHA = float(os.getenv("P2C_ALPHA", 0.5))  # Weight for p95 latency in scoring
-P2C_PENALTY_WEIGHT = float(os.getenv("P2C_PENALTY_WEIGHT", 2.0))  # Weight for recent 5xx rate
+P2C_ALPHA = float(os.getenv("P2C_ALPHA", 0.5))  # Weight for p95 latency in scoring (legacy additive)
+P2C_PENALTY_WEIGHT = float(os.getenv("P2C_PENALTY_WEIGHT", 2.0))  # Weight for recent 5xx rate (legacy additive)
+
+# Peak EWMA scoring (Finagle/Envoy-inspired, replaces additive scoring)
+# score = ewma_rtt * (pending + 1)  -- dimensionally consistent, no tunable weights
+P2C_PEAK_EWMA = os.getenv("P2C_PEAK_EWMA", "true").lower() in ("1", "true", "yes")
+PEAK_EWMA_DECAY_SECS = float(os.getenv("PEAK_EWMA_DECAY_SECS", 10.0))  # Half-life for RTT decay
+PEAK_EWMA_PENALTY_RTT = float(os.getenv("PEAK_EWMA_PENALTY_RTT", 30.0))  # Penalty RTT for failures (secs)
+PEAK_EWMA_DEFAULT_RTT = float(os.getenv("PEAK_EWMA_DEFAULT_RTT", 0.5))  # Cold-start RTT estimate (secs)
 
 # Cost-aware P2C routing (Phase 4)
 def _parse_cost_per_token(s: str) -> dict:
@@ -130,6 +137,12 @@ RETRY_BACKOFF_MS = [int(x) for x in os.getenv("RETRY_BACKOFF_MS", "50,100").spli
 
 # Derive MAX_RETRIES used in existing flows (attempts after the first)
 MAX_RETRIES = max(0, ATTEMPTS_PER_MODEL - 1)
+
+# Same-node retry: when only 1 node exists, retry it after a delay instead of
+# failing immediately.  Covers Ollama model-swap disconnects (~10-30s).
+SAME_NODE_RETRY_ENABLED = os.getenv("SAME_NODE_RETRY_ENABLED", "true").lower() in ("1", "true", "yes")
+SAME_NODE_RETRY_MAX = int(os.getenv("SAME_NODE_RETRY_MAX", 2))
+SAME_NODE_RETRY_DELAY_SECS = float(os.getenv("SAME_NODE_RETRY_DELAY_SECS", 3.0))
 
 # Circuit breaker enhancements
 CIRCUIT_BREAKER_COOLDOWN_SECS = int(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECS", 60))
