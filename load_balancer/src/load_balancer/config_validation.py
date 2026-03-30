@@ -31,14 +31,13 @@ def validate_config() -> None:
             "  Fix: Set CLOUD_BACKENDS=name=url|api_key|provider  or SCAN_HOSTS=host:port"
         )
 
-    # ── Conditionally required ────────────────────────────────────────────────
+    # ── Conditionally required (warning only, not fatal) ────────────────────
     planner_backend = os.getenv("PLANNER_BACKEND", "").strip()
     plan_enabled = os.getenv("MULTI_EXEC_ENABLED", "true").lower() in ("1", "true", "yes")
     if plan_enabled and not planner_backend and not cloud_backends:
-        errors.append(
-            "[CONFIG WARNING] PLANNER_BACKEND is not set and no CLOUD_BACKENDS are defined.\n"
-            "  What it does: PLAN execution mode requires a planner backend for task decomposition.\n"
-            "  Fix: Set PLANNER_BACKEND=<cloud_backend_name> or a host:port"
+        log.warning(
+            "PLANNER_BACKEND is not set and no CLOUD_BACKENDS are defined. "
+            "PLAN execution mode will not work until one is configured."
         )
 
     # ── Numeric range validation ──────────────────────────────────────────────
