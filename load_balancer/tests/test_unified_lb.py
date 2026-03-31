@@ -201,9 +201,9 @@ def test_chat_missing_messages_returns_400(monkeypatch):
     with make_client() as c:
         resp = c.post("/v1/chat/completions", json={"model": "m"})
         assert resp.status_code == 400
-        detail = resp.json().get("detail")
-        assert detail["message"].startswith("Missing")
-        assert detail["missing"] == ["messages"]
+        error = resp.json().get("error")
+        assert error["message"].startswith("Missing")
+        assert error["missing"] == ["messages"]
 
 
 def test_performance_under_load(monkeypatch):

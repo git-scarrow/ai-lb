@@ -89,6 +89,50 @@ router = None
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible error responses
+# ---------------------------------------------------------------------------
+
+_ERROR_TYPE_MAP = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    429: "rate_limit_error",
+    500: "server_error",
+    502: "server_error",
+    503: "service_unavailable",
+}
+
+
+@app.exception_handler(HTTPException)
+async def _openai_error_handler(request: Request, exc: HTTPException):
+    detail = exc.detail
+    if isinstance(detail, dict):
+        message = detail.get("message", str(detail))
+    else:
+        message = str(detail)
+
+    body: dict = {
+        "error": {
+            "message": message,
+            "type": _ERROR_TYPE_MAP.get(exc.status_code, "api_error"),
+            "param": None,
+            "code": None,
+        }
+    }
+    if isinstance(detail, dict):
+        for k, v in detail.items():
+            if k != "message":
+                body["error"][k] = v
+
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=body,
+        headers=dict(exc.headers) if exc.headers else None,
+    )
+
 # Helper to resolve circuit breaker cooldown consistently across legacy and new config
 def _cb_cooldown_secs() -> int:
     try:
@@ -2042,9 +2086,20 @@ async def get_all_models():
         if models_json:
             models = json.loads(models_json).get("data", [])
             for model in models:
-                if model['id'] not in all_models:
-                    all_models[model['id']] = model
-    return {"object": "list", "data": list(all_models.values())}
+                mid = model.get("id")
+                if mid and mid not in all_models:
+                    all_models[mid] = model
+    # Ensure every model object has the OpenAI-required fields
+    data = []
+    for m in all_models.values():
+        data.append({
+            "id": m["id"],
+            "object": m.get("object", "model"),
+            "created": m.get("created", 0),
+            "owned_by": m.get("owned_by", "local"),
+            **{k: v for k, v in m.items() if k not in ("id", "object", "created", "owned_by")},
+        })
+    return {"object": "list", "data": data}
 
 # Latency histogram buckets in seconds
 _LAT_BUCKETS = [0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, float("inf")]
@@ -2711,8 +2766,9 @@ async def chat_completions(request: Request):
         }
         if last_error:
             logger.error("All upstream attempts failed: %s", last_error)
-        # For streaming, we cannot change status mid-stream; yield error body
-        yield json.dumps(err_msg).encode()
+        # Emit error as a named SSE event so clients can parse it cleanly
+        yield f"event: error\ndata: {json.dumps(err_msg)}\n\n".encode()
+        yield b"data: [DONE]\n\n"
 
     if is_stream:
         # Streaming behavior (existing)
@@ -2726,8 +2782,9 @@ async def chat_completions(request: Request):
                         yield data
                     await _set_sticky_node(session_id, model_name, forced_node)
                 except (httpx.RequestError, httpx.HTTPStatusError, CapacityError, RateLimitError) as e:
-                    err = {"error": {"message": f"Upstream error from {forced_node}: {e}"}}
-                    yield json.dumps(err).encode()
+                    err = {"error": {"message": f"Upstream error from {forced_node}: {e}", "type": "server_error"}}
+                    yield f"event: error\ndata: {json.dumps(err)}\n\n".encode()
+                    yield b"data: [DONE]\n\n"
             return StreamingResponse(stream_single(), media_type="text/event-stream", headers={
                 "x-selected-model": model_name,
                 "x-routed-node": forced_node,
@@ -3240,6 +3297,7 @@ async def embeddings(request: Request):
     if not eligible_nodes:
         raise HTTPException(status_code=404, detail=f"No healthy nodes found for model '{model_name}'.")
 
+    start_time = time.monotonic()
     headers = {key: value for key, value in request.headers.items() if key.lower() not in ('host', 'content-length')}
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
     headers["x-request-id"] = request_id

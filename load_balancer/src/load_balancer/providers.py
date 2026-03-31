@@ -160,21 +160,23 @@ class AnthropicAdapter(ProviderAdapter):
                 else:
                     chat_messages.append({"role": msg["role"], "content": content})
 
-        result = {
-            "model": body.get("model"),
-            "messages": chat_messages,
-            "max_tokens": body.get("max_tokens", 4096),
-        }
+        # Start from the original body to preserve unknown/future fields,
+        # then transform the ones Anthropic needs in a different format.
+        result = dict(body)
+
+        # Replace messages (already transformed above)
+        result["messages"] = chat_messages
+        # Anthropic requires max_tokens explicitly
+        result["max_tokens"] = body.get("max_tokens") or body.get("max_completion_tokens") or 4096
+        result.pop("max_completion_tokens", None)
+
         if system_msg:
             result["system"] = system_msg
-        if "temperature" in body:
-            result["temperature"] = body["temperature"]
-        if "stream" in body:
-            result["stream"] = body["stream"]
-        if "top_p" in body:
-            result["top_p"] = body["top_p"]
-        if "stop" in body:
-            result["stop_sequences"] = body["stop"] if isinstance(body["stop"], list) else [body["stop"]]
+
+        # Rename OpenAI "stop" → Anthropic "stop_sequences"
+        if "stop" in result:
+            stop = result.pop("stop")
+            result["stop_sequences"] = stop if isinstance(stop, list) else [stop]
 
         # Transform tools (OpenAI format -> Anthropic format)
         if "tools" in body:
@@ -188,6 +190,14 @@ class AnthropicAdapter(ProviderAdapter):
                         "input_schema": func.get("parameters", {"type": "object", "properties": {}})
                     })
             result["tools"] = anthropic_tools
+
+        # Remove fields that Anthropic explicitly rejects
+        for key in ("functions", "function_call", "tool_choice",
+                     "logit_bias", "logprobs", "top_logprobs", "n",
+                     "presence_penalty", "frequency_penalty",
+                     "stream_options", "response_format", "seed",
+                     "parallel_tool_calls", "service_tier"):
+            result.pop(key, None)
 
         return result
 
