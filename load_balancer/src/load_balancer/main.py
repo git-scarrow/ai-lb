@@ -3267,7 +3267,57 @@ async def responses_api(request: Request):
     if isinstance(inp, str):
         messages.append({"role": "user", "content": inp})
     elif isinstance(inp, list):
-        messages.extend(inp)
+        for item in inp:
+            if isinstance(item, str):
+                messages.append({"role": "user", "content": item})
+            elif isinstance(item, dict):
+                item_type = item.get("type", "")
+                role = item.get("role", "")
+                # Standard chat message with role/content
+                if role and "content" in item:
+                    content = item["content"]
+                    # Content can be string or array of content parts
+                    if isinstance(content, list):
+                        text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") in ("input_text", "output_text", "text")]
+                        content = "\n".join(text_parts) if text_parts else json.dumps(content)
+                    messages.append({"role": role, "content": content})
+                # Responses API "message" type
+                elif item_type == "message":
+                    content = item.get("content", "")
+                    if isinstance(content, list):
+                        text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") in ("input_text", "output_text", "text")]
+                        content = "\n".join(text_parts) if text_parts else ""
+                    messages.append({"role": item.get("role", "user"), "content": content})
+                # Function call (assistant requested a tool call)
+                elif item_type == "function_call":
+                    messages.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": item.get("call_id", item.get("id", f"call_{uuid.uuid4().hex[:8]}")),
+                            "type": "function",
+                            "function": {
+                                "name": item.get("name", ""),
+                                "arguments": item.get("arguments", "{}"),
+                            }
+                        }]
+                    })
+                # Function call output (tool result)
+                elif item_type == "function_call_output":
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": item.get("call_id", ""),
+                        "content": item.get("output", ""),
+                    })
+                else:
+                    # Unknown type — try to pass as user message
+                    text = item.get("text", item.get("content", json.dumps(item)))
+                    if isinstance(text, list):
+                        text = json.dumps(text)
+                    messages.append({"role": "user", "content": str(text)})
+
+    logger.info("responses_api: translated %d input items -> %d messages for model=%s",
+                len(inp) if isinstance(inp, list) else 1, len(messages), raw.get("model", "?"))
 
     cc_body: Dict[str, Any] = {
         "model": raw.get("model", "auto"),
