@@ -9,6 +9,23 @@ CLIENT_TIMEOUT = httpx.Timeout(30.0)
 # Keys should expire if a node is not seen for 5 scan intervals
 KEY_EXPIRY_SECONDS = config.SCAN_INTERVAL * 5
 
+async def _fetch_available_models(session: httpx.AsyncClient, node_address: str) -> list[dict]:
+    """Fetch all models a node can serve, including cold (downloaded but unloaded) ones.
+
+    Ollama's /v1/models only lists models currently loaded in VRAM.
+    /api/tags lists all downloaded models. We merge both so the LB knows
+    about cold models that can be loaded on demand.
+    """
+    try:
+        resp = await session.get(f"http://{node_address}/api/tags")
+        if resp.status_code == 200:
+            tags = resp.json().get("models", [])
+            return [{"id": m["name"], "object": "model", "owned_by": "ollama"} for m in tags]
+    except Exception:
+        pass
+    return []
+
+
 async def check_node(redis_client: redis.Redis, session: httpx.AsyncClient, host: str, port: int):
     """
     Checks a single potential node to see if it's a healthy LLM provider.
@@ -22,12 +39,23 @@ async def check_node(redis_client: redis.Redis, session: httpx.AsyncClient, host
 
         # If we get a successful response, the node is healthy
         models_data = response.json()
-        print(f"✅ Found healthy node: {node_address} with {len(models_data.get('data', []))} models.")
+        loaded_models = models_data.get("data", [])
+
+        # Also fetch all downloaded (cold) models via Ollama's /api/tags
+        available_models = await _fetch_available_models(session, node_address)
+        if available_models:
+            loaded_ids = {m.get("id") for m in loaded_models}
+            for m in available_models:
+                if m["id"] not in loaded_ids:
+                    loaded_models.append(m)
+            models_data["data"] = loaded_models
+
+        print(f"✅ Found healthy node: {node_address} with {len(loaded_models)} models ({len(available_models)} available via /api/tags).")
 
         # Create a pipeline to execute Redis commands atomically
         async with redis_client.pipeline() as pipe:
             pipe.sadd("nodes:healthy", node_address)
-            pipe.set(f"node:{node_address}:models", response.text)
+            pipe.set(f"node:{node_address}:models", json.dumps(models_data))
             # Apply optional per-node concurrency cap
             maxconn = None
             # Explicit map takes precedence
