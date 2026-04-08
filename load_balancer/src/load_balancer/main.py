@@ -3515,7 +3515,22 @@ async def responses_api(request: Request):
         "stream": False,  # Force non-streaming; convert later if needed
     }
     if "tools" in raw:
-        cc_body["tools"] = raw["tools"]
+        # Convert tools from Responses API format to Chat Completions format.
+        # Responses API:      {"type":"function", "name":"…", "parameters":{…}}
+        # Chat Completions:   {"type":"function", "function":{"name":"…", "parameters":{…}}}
+        cc_tools = []
+        for tool in raw["tools"]:
+            if "function" in tool:
+                cc_tools.append(tool)  # already Chat Completions format
+            else:
+                cc_tools.append({
+                    "type": tool.get("type", "function"),
+                    "function": {
+                        k: v for k, v in tool.items()
+                        if k not in ("type",)
+                    },
+                })
+        cc_body["tools"] = cc_tools
     if "tool_choice" in raw:
         cc_body["tool_choice"] = raw["tool_choice"]
     if "max_output_tokens" in raw:
@@ -3544,12 +3559,17 @@ async def responses_api(request: Request):
 
     # Tool calls
     for tc in msg.get("tool_calls", []):
+        fn_name = tc.get("function", {}).get("name", "")
+        if not fn_name:
+            logger.warning("responses_api: dropping tool call with empty function name (model=%s)",
+                           raw.get("model", "?"))
+            continue
         output.append({
             "type": "function_call",
             "id": f"fc_{uuid.uuid4().hex[:24]}",
             "call_id": tc.get("id", f"call_{uuid.uuid4().hex[:24]}"),
-            "name": tc["function"]["name"],
-            "arguments": tc["function"]["arguments"],
+            "name": fn_name,
+            "arguments": tc.get("function", {}).get("arguments", "{}"),
         })
 
     # Text content (some models put text in "reasoning" instead of "content")
