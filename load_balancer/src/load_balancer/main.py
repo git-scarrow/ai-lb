@@ -3506,8 +3506,15 @@ async def responses_api(request: Request):
                         text = json.dumps(text)
                     messages.append({"role": "user", "content": str(text)})
 
-    logger.info("responses_api: translated %d input items -> %d messages for model=%s",
-                len(inp) if isinstance(inp, list) else 1, len(messages), raw.get("model", "?"))
+    logger.info("responses_api: translated %d input items -> %d messages for model=%s, tools=%d",
+                len(inp) if isinstance(inp, list) else 1, len(messages), raw.get("model", "?"),
+                len(raw.get("tools", [])))
+    # Debug: log tool schemas on first request (small message count = new conversation)
+    if len(messages) <= 3 and raw.get("tools"):
+        for t in raw["tools"][:5]:  # first 5 tools only
+            name = t.get("name", t.get("function", {}).get("name", "?"))
+            params = t.get("parameters", t.get("function", {}).get("parameters", {}))
+            logger.info("responses_api: tool schema: name=%s params=%s", name, json.dumps(params)[:200])
 
     cc_body: Dict[str, Any] = {
         "model": raw.get("model", "auto"),
