@@ -3506,9 +3506,9 @@ async def responses_api(request: Request):
                         text = json.dumps(text)
                     messages.append({"role": "user", "content": str(text)})
 
-    logger.info("responses_api: translated %d input items -> %d messages for model=%s, tools=%d",
+    logger.info("responses_api: translated %d input items -> %d messages for model=%s, tools=%d, stream=%s",
                 len(inp) if isinstance(inp, list) else 1, len(messages), raw.get("model", "?"),
-                len(raw.get("tools", [])))
+                len(raw.get("tools", [])), raw.get("stream", "unset"))
     # Debug: log tool schemas on first request (small message count = new conversation)
     if len(messages) <= 3 and raw.get("tools"):
         for t in raw["tools"][:5]:  # first 5 tools only
@@ -3572,19 +3572,13 @@ async def responses_api(request: Request):
             logger.warning("responses_api: dropping tool call with empty function name (model=%s)",
                            raw.get("model", "?"))
             continue
-        # Parse arguments string to object — OpenClaw expects a JSON object,
-        # not the JSON-encoded string that Ollama/OpenAI chat completions returns.
-        try:
-            fn_args_obj = json.loads(fn_args) if isinstance(fn_args, str) else fn_args
-        except (json.JSONDecodeError, TypeError):
-            fn_args_obj = {}
         logger.info("responses_api: tool_call name=%s args=%s", fn_name, repr(fn_args)[:200])
         output.append({
             "type": "function_call",
             "id": f"fc_{uuid.uuid4().hex[:24]}",
             "call_id": tc.get("id", f"call_{uuid.uuid4().hex[:24]}"),
             "name": fn_name,
-            "arguments": fn_args_obj,
+            "arguments": fn_args if isinstance(fn_args, str) else json.dumps(fn_args),
         })
 
     # Text content (some models put text in "reasoning" instead of "content")
