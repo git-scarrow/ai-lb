@@ -34,6 +34,8 @@ from .execution.modes import (
 )
 from .providers import get_adapter
 from .config_validation import validate_config
+from .task_classification import TaskClass
+from .task_routing import model_candidates_for_task
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -348,14 +350,18 @@ async def _model_availability(model_id: str) -> dict:
     }
 
 
-async def _routing_headers(model_name: str, eligible_count: int) -> dict:
+async def _routing_headers(model_name: str, eligible_count: int, task_class: Optional[str] = None) -> dict:
     """Build x-llb-* routing diagnostic headers."""
     avail = await _model_availability(model_name)
-    return {
+    hdrs = {
         "x-llb-eligible-nodes": str(eligible_count),
         "x-llb-total-nodes": str(avail["total_nodes"]),
         "x-llb-routing-strategy": getattr(config, "ROUTING_STRATEGY", "P2C"),
+        "x-llb-selected-model": model_name,
     }
+    if task_class is not None:
+        hdrs["x-llb-task-class"] = task_class
+    return hdrs
 
 
 def _is_model_sentinel(name: Optional[str]) -> bool:
@@ -2445,6 +2451,23 @@ async def chat_completions(request: Request):
     _complexity_score: Optional[float] = None
     _complexity_tier: Optional[str] = None  # "small" | "medium" | "large" | None
 
+    # Task classification (always runs; used for routing and security guardrail)
+    _task_class, _task_candidates = model_candidates_for_task(body)
+    logger.debug("Task classification: class=%s candidates=%s", _task_class.value, _task_candidates)
+
+    # Security guardrail: block explicit local fast-path model requests for security tasks
+    _fast_path_candidates = set(
+        (getattr(config, "MODEL_CLASSES", {}).get("local_coding_fast_path") or {}).get("candidates", [])
+    )
+    if _task_class == TaskClass.SECURITY_SENSITIVE and not _is_model_sentinel(model_name) and model_name in _fast_path_candidates:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Local fast-path routing is disabled for security-sensitive tasks.",
+                "task_class": _task_class.value,
+            },
+        )
+
     # Resolve auto/default sentinel to a concrete model id
     if _is_model_sentinel(model_name):
         prefer_intersection = request.query_params.get("require_all", "false").lower() in ("1", "true", "yes")
@@ -2461,6 +2484,24 @@ async def chat_completions(request: Request):
                     logger.info("Tool-aware routing: %d tools in request -> selected '%s' (%d nodes)",
                                 len(body["tools"]), tc_model, len(tc_nodes))
                     break
+
+        # Task-based routing: use classified task class to select model candidates.
+        # Runs after tool-aware (tools are a stronger signal) but before complexity scoring.
+        if not resolved and _task_candidates:
+            for candidate in _task_candidates:
+                candidate_nodes = await get_eligible_nodes(candidate)
+                if candidate_nodes:
+                    resolved = candidate
+                    logger.info(
+                        "Task routing: class=%s selected '%s' (%d nodes)",
+                        _task_class.value, candidate, len(candidate_nodes),
+                    )
+                    break
+            if not resolved:
+                logger.debug(
+                    "Task routing: class=%s no eligible candidates %s; falling through",
+                    _task_class.value, _task_candidates,
+                )
 
         # Complexity-based tier selection (RouteLLM-inspired, Apache-2.0 — lm-sys/RouteLLM)
         if not resolved and getattr(config, "COMPLEXITY_ROUTING_ENABLED", False):
@@ -2497,6 +2538,10 @@ async def chat_completions(request: Request):
         body["model"] = resolved
         model_name = resolved
 
+    logger.info(
+        "Routing decision: task_class=%s selected_model=%s",
+        _task_class.value, model_name,
+    )
     eligible_nodes = await get_eligible_nodes(model_name)
 
     # Track on-demand warm/wait for observability headers
@@ -2547,7 +2592,7 @@ async def chat_completions(request: Request):
                     model_name = fb_model
                     eligible_nodes = fb_nodes
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
-    _llb_hdrs = await _routing_headers(model_name, len(eligible_nodes))
+    _llb_hdrs = await _routing_headers(model_name, len(eligible_nodes), task_class=_task_class.value)
 
     # Check for multi-backend execution mode or fallback chain
     exec_config = _parse_execution_mode(request)
@@ -2631,6 +2676,7 @@ async def chat_completions(request: Request):
     headers["x-request-id"] = request_id
     forced_node = request.query_params.get("node")
     session_id = request.headers.get("x-session-id")
+    emit_meta = request.headers.get("x-llb-events", "").lower() in ("1", "true", "meta")
 
     async def attempt_stream(node: str):
         # Determine URL, headers, and request body based on backend type (cloud vs local)
@@ -2779,17 +2825,17 @@ async def chat_completions(request: Request):
             tried.add(candidate)
             tried_order.append(candidate)
             attempts += 1
-            # Emit SSE meta for initial attempt or failover
-            meta = {
-                "request_id": request_id,
-                "model": model_name,
-                "node": candidate,
-                "attempts": attempts,
-                "failover_count": max(0, attempts - 1),
-                "event": "failover" if attempts > 1 else "meta",
-            }
-            yield f"event: {meta['event']}\n".encode()
-            yield ("data: " + json.dumps(meta) + "\n\n").encode()
+            if emit_meta:
+                meta = {
+                    "request_id": request_id,
+                    "model": model_name,
+                    "node": candidate,
+                    "attempts": attempts,
+                    "failover_count": max(0, attempts - 1),
+                    "event": "failover" if attempts > 1 else "meta",
+                }
+                yield f"event: {meta['event']}\n".encode()
+                yield ("data: " + json.dumps(meta) + "\n\n").encode()
             try:
                 await _inc_requests_total()
                 # Streaming hedging decision
@@ -2874,8 +2920,9 @@ async def chat_completions(request: Request):
                             "secondary": secondary,
                             "event": "hedge_start",
                         }
-                        yield b"event: hedge_start\n"
-                        yield ("data: " + json.dumps(evt) + "\n\n").encode()
+                        if emit_meta:
+                            yield b"event: hedge_start\n"
+                            yield ("data: " + json.dumps(evt) + "\n\n").encode()
                         try:
                             await redis_client.incrby("lb:hedges_total", 1)
                         except Exception:
@@ -2907,8 +2954,9 @@ async def chat_completions(request: Request):
                             "winner": secondary,
                             "event": "hedge_winner",
                         }
-                        yield b"event: hedge_winner\n"
-                        yield ("data: " + json.dumps(w_evt) + "\n\n").encode()
+                        if emit_meta:
+                            yield b"event: hedge_winner\n"
+                            yield ("data: " + json.dumps(w_evt) + "\n\n").encode()
                         try:
                             await _record_stream_duration(model_name, secondary, time.monotonic() - start_time)
                         except Exception:
@@ -2941,8 +2989,9 @@ async def chat_completions(request: Request):
                         "secondary": secondary,
                         "event": "hedge_start",
                     }
-                    yield b"event: hedge_start\n"
-                    yield ("data: " + json.dumps(evt) + "\n\n").encode()
+                    if emit_meta:
+                        yield b"event: hedge_start\n"
+                        yield ("data: " + json.dumps(evt) + "\n\n").encode()
                     try:
                         await redis_client.incrby("lb:hedges_total", 1)
                     except Exception:
@@ -2992,8 +3041,9 @@ async def chat_completions(request: Request):
                         "winner": winner,
                         "event": "hedge_winner",
                     }
-                    yield b"event: hedge_winner\n"
-                    yield ("data: " + json.dumps(w_evt) + "\n\n").encode()
+                    if emit_meta:
+                        yield b"event: hedge_winner\n"
+                        yield ("data: " + json.dumps(w_evt) + "\n\n").encode()
                     try:
                         await _record_stream_duration(model_name, winner, time.monotonic() - start_time)
                     except Exception:

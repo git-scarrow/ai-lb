@@ -95,7 +95,31 @@ MODEL_CLASSES = {
     "historical_medium": {
         "candidates": ["qwen/qwen3-8b", "mlx-community/gpt-oss-20b"],
         "min_nodes": 2
-    }
+    },
+    # Task-based routing classes (used by task_routing.py)
+    "local_coding_fast_path": {
+        "candidates": [
+            "gemma4:26b-local",
+            "gemma-4-26b-it",
+            "gemma-4-26b-a4b-it",
+        ],
+        "min_nodes": 1,
+    },
+    "standard_coding": {
+        "candidates": [
+            "claude-sonnet-4.5",
+            "gpt-5.1-codex",
+            "qwen3-coder-cloud",
+        ],
+        "min_nodes": 1,
+    },
+    "security_sensitive": {
+        "candidates": [
+            "gpt-5.5-thinking",
+            "claude-opus-4.5",
+        ],
+        "min_nodes": 1,
+    },
 }
 
 # Load model classes from environment if provided
